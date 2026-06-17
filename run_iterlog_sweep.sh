@@ -79,11 +79,36 @@ max_model_len=4096
 
 # where the server listens / how we detect readiness
 host="localhost"
-port=8000
-# NOTE: host/port are wired to the server (--port) and the health poll only.
-# The benchmark below uses vLLM's default target (localhost:8000). If you
-# change $port, also point the benchmark at it (--base-url / --port, depending
-# on your vLLM version) or the bench will hit the wrong server silently.
+base_port="${BASE_PORT:-8000}"
+case "$base_port" in
+  ''|*[!0-9]*) echo "BASE_PORT must be a non-negative integer (got '${base_port}')" >&2; exit 2;;
+esac
+cuda_port_offset() {
+  local visible="${CUDA_VISIBLE_DEVICES:-}"
+  [ -z "$visible" ] && { echo 0; return 0; }
+
+  visible="${visible//[[:space:]]/}"
+  local selected="" device
+  local -a devices
+  IFS=',' read -ra devices <<< "$visible"
+  for device in "${devices[@]}"; do
+    [ -z "$device" ] && continue
+    case "$device" in
+      *[!0-9]*)
+        echo "!!! CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}' is not a numeric index list; using base port ${base_port}" >&2
+        echo 0
+        return 0
+        ;;
+    esac
+    if [ -z "$selected" ] || [ "$device" -lt "$selected" ]; then
+      selected="$device"
+    fi
+  done
+
+  echo "${selected:-0}"
+}
+port=$((base_port + $(cuda_port_offset)))
+bench_base_url="http://${host}:${port}"
 health_path="${HEALTH_PATH:-/health}"   # set HEALTH_PATH=/v1/models if /health reports ready before weights finish loading
 ready_timeout="${READY_TIMEOUT:-600}"   # seconds to wait for readiness before skipping the config
 poll_interval=2
@@ -450,7 +475,7 @@ EOF
 }
 
 # ================================ sweep ==================================
-echo ">>> sweep: model=${model} root=${output_root} profiler=${profiler}" >&2
+echo ">>> sweep: model=${model} root=${output_root} port=${port} profiler=${profiler}" >&2
 
 for input_len in "${input_lens[@]}"; do
 for output_len in "${output_lens[@]}"; do
@@ -498,6 +523,7 @@ for seed in 200 201 202; do
   if vllm bench serve \
       --model "$model" \
       --backend openai \
+      --base-url "$bench_base_url" \
       --endpoint /v1/completions \
       --dataset-name random \
       --random-input-len "$input_len" \
