@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_iterlog_sweep.sh — for each (burstiness, seed) config:
+# run_iterlog_sweep.sh — for each workload/burstiness/seed config:
 #   1. start vLLM with iteration logging piped to burst<b>/log_<seed>.txt
 #   2. wait until the server is ready
 #   3. (optional) start nsys and/or py-spy profiling of the SERVER
@@ -31,7 +31,7 @@
 #   ./run_iterlog_sweep.sh --profiler torch --torch-delay-iters 2000 --torch-max-iters 300
 #                                              # torch: profile a 300-iter steady-state slice
 #
-# Per-config outputs land in burst<b>/ sharing the result basename:
+# Per-config outputs land in in<I>out<O>/rate<R>/burst<b>/ sharing the result basename:
 #   prompts<N>seed<S>.json  (+ .nsys-rep / .pyspy.<ext> / .profmeta.json when profiling)
 #
 # The torch profiler is different from nsys/py-spy: it is NOT an attach. vLLM's
@@ -64,10 +64,13 @@ model="meta-llama/Llama-3.1-8B"
 model_name="llama-3.1-8b"
 engine="vllm"
 gpu="a100-40gb-sxm4"
-request_rate=40
-num_prompts=1000
-input_len=512
-output_len=128
+
+# Workload sweep values. Single-value arrays preserve the old defaults while
+# keeping every workload parameter in the sweep loop where paths are built.
+request_rates=(10 40 80)
+num_prompts_values=(1000)
+input_lens=(512)
+output_lens=(128)
 
 # server launch flags (kept from your serve script; server must serve the
 # SAME model the benchmark hits, so both are driven from $model)
@@ -240,9 +243,8 @@ pyspy_ext() {
   esac
 }
 
-result_root="./${engine}/${gpu}/${model_name}/in${input_len}out${output_len}"
-mkdir -p "$result_root"
-failures_log="${result_root}/sweep_failures.log"
+output_root="./${engine}/${gpu}/${model_name}"
+failures_log="./sweep_failures.log"
 : > "$failures_log"
 
 # ============================ server lifecycle ============================
@@ -448,17 +450,22 @@ EOF
 }
 
 # ================================ sweep ==================================
-echo ">>> sweep: model=${model} root=${result_root} profiler=${profiler}" >&2
+echo ">>> sweep: model=${model} root=${output_root} profiler=${profiler}" >&2
 
-for requset_rate in 10 40 80; do
+for input_len in "${input_lens[@]}"; do
+for output_len in "${output_lens[@]}"; do
+for request_rate in "${request_rates[@]}"; do
+for num_prompts in "${num_prompts_values[@]}"; do
 for burstiness in 1.0 0.5 0.1; do
 for seed in 200 201 202; do
+  result_root="${output_root}/in${input_len}out${output_len}"
   out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
   mkdir -p "$out_dir"
   log_file="${out_dir}/num_prompts${num_prompts}log_${seed}.txt"
   base="${out_dir}/prompts${num_prompts}seed${seed}"   # shared basename for json + profiler outputs
-  tag="burst=${burstiness} seed=${seed}"
-  NSYS_SESSION="vllmprof_${num_prompts}_${seed}"        # per-config nsys session name
+  tag="in=${input_len} out=${output_len} rate=${request_rate} prompts=${num_prompts} burst=${burstiness} seed=${seed}"
+  burst_tag="${burstiness//./p}"
+  NSYS_SESSION="vllmprof_i${input_len}_o${output_len}_r${request_rate}_p${num_prompts}_b${burst_tag}_s${seed}"  # per-config nsys session name
 
   # Per-config torch trace dir. vLLM needs an absolute path and writes its own
   # rank*/async_llm trace files + profiler_out_<rank>.txt into it, so the
@@ -520,6 +527,9 @@ for seed in 200 201 202; do
   write_profmeta "$base" "$bench_start_epoch" "$bench_end_epoch"
 
   stop_server
+done
+done
+done
 done
 done
 done
