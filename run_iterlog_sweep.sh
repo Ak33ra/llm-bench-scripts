@@ -64,7 +64,6 @@ model="meta-llama/Llama-3.1-8B"
 model_name="llama-3.1-8b"
 engine="vllm"
 gpu="a100-40gb-sxm4"
-request_rate=40
 num_prompts=1000
 input_len=512
 output_len=128
@@ -450,7 +449,7 @@ EOF
 # ================================ sweep ==================================
 echo ">>> sweep: model=${model} root=${result_root} profiler=${profiler}" >&2
 
-for requset_rate in 10 40 80; do
+for request_rate in 10 40 80; do
 for burstiness in 1.0 0.5 0.1; do
 for seed in 200 201 202; do
   out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
