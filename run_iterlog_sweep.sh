@@ -123,6 +123,14 @@ nsys_sample="none"               # nsys --sample; 'none' disables CPU backtrace
                                  #   sampling -> smaller/cheaper traces, the
                                  #   CUDA timeline is the point here.
 nsys_extra=""                    # extra args passed to `nsys launch`
+# GPU hardware-metric sampling (SM/Tensor/DRAM utilization). Set on `nsys start`
+# (launch doesn't accept these). 'ga100' is the metric set for A100 (GA100, sm80);
+# use 'gh100' for GH200, or `nsys profile --gpu-metrics-set=help` to list. Devices
+# 'cuda-visible' scopes sampling to the GPU(s) this job uses; 10 kHz (the default)
+# gives hundreds of samples per decode iteration.
+nsys_gpu_metrics_set="ga100"
+nsys_gpu_metrics_devices="cuda-visible"
+nsys_gpu_metrics_frequency="10000"
 pyspy_format="chrometrace"       # flamegraph | raw | speedscope | chrometrace
                                  #   chrometrace/speedscope keep a time axis;
                                  #   raw/flamegraph are aggregate-only.
@@ -391,9 +399,16 @@ start_profiling() {
 
   if [ "$NSYS_ON" = 1 ]; then
     NSYS_OUT="${base}.nsys-rep"
-    # nsys appends .nsys-rep itself, so hand it the bare base. --sample is set
-    # here (not on launch) per recent nsys; 'none' disables CPU backtrace sampling.
-    if ! nsys start --session "$NSYS_SESSION" --sample "$nsys_sample" -o "$base" >/dev/null 2>&1; then
+    # nsys appends .nsys-rep itself, so hand it the bare base. --sample and the
+    # --gpu-metrics-* options are set here (not on launch) per recent nsys;
+    # 'none' sample disables CPU backtrace sampling, while gpu-metrics adds the
+    # sampled SM/Tensor/DRAM utilization timeline used for the decode-vs-mixed
+    # hardware-utilization analysis.
+    if ! nsys start --session "$NSYS_SESSION" --sample "$nsys_sample" \
+           --gpu-metrics-set "$nsys_gpu_metrics_set" \
+           --gpu-metrics-devices "$nsys_gpu_metrics_devices" \
+           --gpu-metrics-frequency "$nsys_gpu_metrics_frequency" \
+           -o "$base" >/dev/null 2>&1; then
       echo "!!! nsys start failed for ${base} (session ${NSYS_SESSION})" >&2
     fi
   fi
