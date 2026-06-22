@@ -1,0 +1,5 @@
+pip install uv
+uv pip install vllm
+pip uninstall vllm
+VLLM_USE_PRECOMPILED=1 pip install --no-deps -e .
+pip install "fastapi<0.137"
