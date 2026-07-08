@@ -60,17 +60,17 @@ set -euo pipefail
 #model_name="qwen"
 #model="zai-org/GLM-4.7-Flash"
 #model_name="glm-4.7-flash"
-model="meta-llama/Llama-3.1-8B"
-model_name="llama-3.1-8b"
-engine="vllm"
+model="Qwen/Qwen3-32B"
+model_name="qwen-3-32b"
+engine="vllm-torch-profile"
 gpu="h200"
 
 # Workload sweep values. Single-value arrays preserve the old defaults while
 # keeping every workload parameter in the sweep loop where paths are built.
-request_rates=(10 20 30 40 80)
-num_prompts_values=(1000)
-input_lens=(128 256 512 768)
-output_lens=(128 256 512)
+request_rates=(20)
+num_prompts_values=(250)
+input_lens=(1024)
+output_lens=(128)
 
 # server launch flags (kept from your serve script; server must serve the
 # SAME model the benchmark hits, so both are driven from $model)
@@ -123,14 +123,6 @@ nsys_sample="none"               # nsys --sample; 'none' disables CPU backtrace
                                  #   sampling -> smaller/cheaper traces, the
                                  #   CUDA timeline is the point here.
 nsys_extra=""                    # extra args passed to `nsys launch`
-# GPU hardware-metric sampling (SM/Tensor/DRAM utilization). Set on `nsys start`
-# (launch doesn't accept these). 'ga100' is the metric set for A100 (GA100, sm80);
-# use 'gh100' for GH200, or `nsys profile --gpu-metrics-set=help` to list. Devices
-# 'cuda-visible' scopes sampling to the GPU(s) this job uses; 10 kHz (the default)
-# gives hundreds of samples per decode iteration.
-nsys_gpu_metrics_set="ga100"
-nsys_gpu_metrics_devices="cuda-visible"
-nsys_gpu_metrics_frequency="10000"
 pyspy_format="chrometrace"       # flamegraph | raw | speedscope | chrometrace
                                  #   chrometrace/speedscope keep a time axis;
                                  #   raw/flamegraph are aggregate-only.
@@ -399,16 +391,9 @@ start_profiling() {
 
   if [ "$NSYS_ON" = 1 ]; then
     NSYS_OUT="${base}.nsys-rep"
-    # nsys appends .nsys-rep itself, so hand it the bare base. --sample and the
-    # --gpu-metrics-* options are set here (not on launch) per recent nsys;
-    # 'none' sample disables CPU backtrace sampling, while gpu-metrics adds the
-    # sampled SM/Tensor/DRAM utilization timeline used for the decode-vs-mixed
-    # hardware-utilization analysis.
-    if ! nsys start --session "$NSYS_SESSION" --sample "$nsys_sample" \
-           --gpu-metrics-set "$nsys_gpu_metrics_set" \
-           --gpu-metrics-devices "$nsys_gpu_metrics_devices" \
-           --gpu-metrics-frequency "$nsys_gpu_metrics_frequency" \
-           -o "$base" >/dev/null 2>&1; then
+    # nsys appends .nsys-rep itself, so hand it the bare base. --sample is set
+    # here (not on launch) per recent nsys; 'none' disables CPU backtrace sampling.
+    if ! nsys start --session "$NSYS_SESSION" --sample "$nsys_sample" -o "$base" >/dev/null 2>&1; then
       echo "!!! nsys start failed for ${base} (session ${NSYS_SESSION})" >&2
     fi
   fi
@@ -496,8 +481,8 @@ for input_len in "${input_lens[@]}"; do
 for output_len in "${output_lens[@]}"; do
 for request_rate in "${request_rates[@]}"; do
 for num_prompts in "${num_prompts_values[@]}"; do
-for burstiness in 1.0 0.5 0.1; do
-for seed in 0 1 2 3 4; do
+for burstiness in 1.0 0.1; do
+for seed in 0; do
   result_root="${output_root}/in${input_len}out${output_len}"
   out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
   mkdir -p "$out_dir"
@@ -537,15 +522,14 @@ for seed in 0 1 2 3 4; do
   bench_start_epoch=$(date +%s.%N)
   if vllm bench serve \
       --model "$model" \
-      --backend openai \
+      --backend openai-chat \
       --base-url "$bench_base_url" \
-      --endpoint /v1/completions \
+      --endpoint /v1/chat/completions \
       --dataset-name random \
       --random-input-len "$input_len" \
       --random-output-len "$output_len" \
       --ignore-eos \
       --num-prompts "$num_prompts" \
-      --num-warmups 20 \
       --request-rate "$request_rate" \
       --seed "$seed" \
       --burstiness "$burstiness" \
