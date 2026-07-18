@@ -58,17 +58,17 @@ set -euo pipefail
 # ============================ shared constants ============================
 model="Qwen/Qwen3.5-9B"
 model_name="qwen-3.5-9b"
-#model="zai-org/GLM-4.7-Flash"
-#model_name="glm-4.7-flash"
 engine="vllm"
 gpu="h200"
 
 # Workload sweep values. Single-value arrays preserve the old defaults while
 # keeping every workload parameter in the sweep loop where paths are built.
-request_rates=(40)
-num_prompts_values=(750)
-input_lens=(256)
-output_lens=(256)
+request_rates=(40 60)
+num_prompts_values=(1000)
+input_lens=(128 256)
+output_lens=(128 256)
+burstiness_vals=(1.0 0.5 0.1)
+seeds=(0 1 2 3 4)
 
 # server launch flags (kept from your serve script; server must serve the
 # SAME model the benchmark hits, so both are driven from $model)
@@ -479,8 +479,8 @@ for input_len in "${input_lens[@]}"; do
 for output_len in "${output_lens[@]}"; do
 for request_rate in "${request_rates[@]}"; do
 for num_prompts in "${num_prompts_values[@]}"; do
-for burstiness in 1.0 0.5 0.1; do
-for seed in 0; do
+for burstiness in "${burstiness_vals[@]}"; do
+for seed in "${seeds[@]}"; do
   result_root="${output_root}/in${input_len}out${output_len}"
   out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
   mkdir -p "$out_dir"
