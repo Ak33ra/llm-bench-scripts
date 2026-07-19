@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# run_iterlog_sweep.sh — for each workload/burstiness/seed config:
+# run_burstgpt_iterlog_sweep.sh — for each (burstiness, seed) config:
 #   1. start vLLM with iteration logging piped to burst<b>/log_<seed>.txt
 #   2. wait until the server is ready
 #   3. (optional) start nsys and/or py-spy profiling of the SERVER
-#   4. run the matching benchmark -> burst<b>/seed<seed>.json
+#   4. run the matching BurstGPT benchmark -> burst<b>/seed<seed>.json
 #   5. (optional) stop profiling -> burst<b>/<base>.nsys-rep / .pyspy.<ext>
 #   6. stop the server
 # then move to the next config. One full server restart per config.
@@ -18,21 +18,21 @@
 # wall-clock timestamps in the iteration log.
 #
 # Examples:
-#   ./run_iterlog_sweep.sh                     # no profiling (default, unchanged behavior)
-#   ./run_iterlog_sweep.sh --profiler pyspy    # py-spy only: chrometrace @100Hz, --subprocesses
-#   ./run_iterlog_sweep.sh --profiler nsys     # nsys only: -t cuda,nvtx,osrt --sample none
-#   ./run_iterlog_sweep.sh --profiler both     # nsys + py-spy together (higher overhead; see usage())
-#   ./run_iterlog_sweep.sh --profiler torch    # vLLM built-in PyTorch profiler (server-gated)
+#   ./run_burstgpt_iterlog_sweep.sh                     # no profiling (default, unchanged behavior)
+#   ./run_burstgpt_iterlog_sweep.sh --profiler pyspy    # py-spy only: chrometrace @100Hz, --subprocesses
+#   ./run_burstgpt_iterlog_sweep.sh --profiler nsys     # nsys only: -t cuda,nvtx,osrt --sample none
+#   ./run_burstgpt_iterlog_sweep.sh --profiler both     # nsys + py-spy together (higher overhead; see usage())
+#   ./run_burstgpt_iterlog_sweep.sh --profiler torch    # vLLM built-in PyTorch profiler (server-gated)
 #
 #   # tweak profiler defaults:
-#   ./run_iterlog_sweep.sh --profiler pyspy --pyspy-rate 250 --pyspy-extra "--nonblocking"
-#   ./run_iterlog_sweep.sh --profiler pyspy --pyspy-format speedscope
-#   ./run_iterlog_sweep.sh --profiler nsys  --nsys-trace cuda,nvtx --nsys-sample process-tree
-#   ./run_iterlog_sweep.sh --profiler torch --torch-delay-iters 2000 --torch-max-iters 300
+#   ./run_burstgpt_iterlog_sweep.sh --profiler pyspy --pyspy-rate 250 --pyspy-extra "--nonblocking"
+#   ./run_burstgpt_iterlog_sweep.sh --profiler pyspy --pyspy-format speedscope
+#   ./run_burstgpt_iterlog_sweep.sh --profiler nsys  --nsys-trace cuda,nvtx --nsys-sample process-tree
+#   ./run_burstgpt_iterlog_sweep.sh --profiler torch --torch-delay-iters 2000 --torch-max-iters 300
 #                                              # torch: profile a 300-iter steady-state slice
 #
-# Per-config outputs land in in<I>out<O>/rate<R>/burst<b>/ sharing the result basename:
-#   prompts<N>seed<S>.json  (+ .nsys-rep / .pyspy.<ext> / .profmeta.json when profiling)
+# Per-config outputs land in burst<b>/ sharing the result basename:
+#   seed<S>.json  (+ .nsys-rep / .pyspy.<ext> / .profmeta.json when profiling)
 #
 # The torch profiler is different from nsys/py-spy: it is NOT an attach. vLLM's
 # own engine writes the traces, gated by `vllm serve --profiler-config` (enables
@@ -40,7 +40,7 @@
 # around the request loop). vLLM names the trace files itself (rank suffix +
 # timestamp), so to follow the basename scheme each config's traces are dumped
 # into their OWN per-config subdir:
-#   burst<b>/prompts<N>seed<S>_torchprof/
+#   burst<b>/seed<S>_torchprof/
 #     <dp..tp..>_rank<R>.<ts>.pt.trace.json.gz   <- per-worker GPU+CPU traces (the useful ones)
 #     <host>_<pid>.async_llm.<ts>.pt.trace.json.gz  <- front-end CPU-only trace
 #     profiler_out_<rank>.txt                       <- text summary table
@@ -48,27 +48,22 @@
 # https://ui.perfetto.dev/ , no untar needed. NOTE: torch profiles the ENTIRE
 # benchmark window with no iteration cap, so at high --num-prompts the traces get
 # large and slow to flush; VLLM_RPC_TIMEOUT is bumped automatically to cover it.
-# Run `./run_iterlog_sweep.sh --help` for the full option list.
+# Run `./run_burstgpt_iterlog_sweep.sh --help` for the full option list.
 #
 # Other knobs are environment variables (not CLI flags), e.g.:
-#   HEALTH_PATH=/v1/models READY_TIMEOUT=900 SETTLE_SECS=5 ./run_iterlog_sweep.sh --profiler nsys
+#   HEALTH_PATH=/v1/models READY_TIMEOUT=900 SETTLE_SECS=5 ./run_burstgpt_iterlog_sweep.sh --profiler nsys
 #
 set -euo pipefail
 
 # ============================ shared constants ============================
-model="Qwen/Qwen3.5-9B"
-model_name="qwen-3.5-9b"
-engine="vllm"
+model="meta-llama/Llama-3.1-8B"
+model_name="llama-3.1-8b"
+engine="vllm-fa2"
 gpu="h200"
-
-# Workload sweep values. Single-value arrays preserve the old defaults while
-# keeping every workload parameter in the sweep loop where paths are built.
-request_rates=(40)
-num_prompts_values=(1000)
-input_lens=(128)
-output_lens=(128)
-burstiness_vals=(1.0 0.5 0.1)
-seeds=(0)
+request_rate=40
+num_prompts=1000
+input_len=128
+output_len=128
 
 # server launch flags (kept from your serve script; server must serve the
 # SAME model the benchmark hits, so both are driven from $model)
@@ -77,36 +72,11 @@ max_model_len=4096
 
 # where the server listens / how we detect readiness
 host="localhost"
-base_port="${BASE_PORT:-8000}"
-case "$base_port" in
-  ''|*[!0-9]*) echo "BASE_PORT must be a non-negative integer (got '${base_port}')" >&2; exit 2;;
-esac
-cuda_port_offset() {
-  local visible="${CUDA_VISIBLE_DEVICES:-}"
-  [ -z "$visible" ] && { echo 0; return 0; }
-
-  visible="${visible//[[:space:]]/}"
-  local selected="" device
-  local -a devices
-  IFS=',' read -ra devices <<< "$visible"
-  for device in "${devices[@]}"; do
-    [ -z "$device" ] && continue
-    case "$device" in
-      *[!0-9]*)
-        echo "!!! CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}' is not a numeric index list; using base port ${base_port}" >&2
-        echo 0
-        return 0
-        ;;
-    esac
-    if [ -z "$selected" ] || [ "$device" -lt "$selected" ]; then
-      selected="$device"
-    fi
-  done
-
-  echo "${selected:-0}"
-}
-port=$((base_port + $(cuda_port_offset)))
-bench_base_url="http://${host}:${port}"
+port=8000
+# NOTE: host/port are wired to the server (--port) and the health poll only.
+# The benchmark below uses vLLM's default target (localhost:8000). If you
+# change $port, also point the benchmark at it (--base-url / --port, depending
+# on your vLLM version) or the bench will hit the wrong server silently.
 health_path="${HEALTH_PATH:-/health}"   # set HEALTH_PATH=/v1/models if /health reports ready before weights finish loading
 ready_timeout="${READY_TIMEOUT:-600}"   # seconds to wait for readiness before skipping the config
 poll_interval=2
@@ -154,7 +124,7 @@ torch_max_iters=0                # engine steps to actually profile (0 = until /
 
 usage() {
   cat <<'EOF'
-Usage: run_iterlog_sweep.sh [options]
+Usage: run_burstgpt_iterlog_sweep.sh [options]
 
   --profiler MODE       none | nsys | pyspy | both | torch  (default: none)
   --nsys-trace LIST     nsys -t trace selectors        (default: cuda,nvtx,osrt)
@@ -266,8 +236,9 @@ pyspy_ext() {
   esac
 }
 
-output_root="./${engine}/${gpu}/${model_name}"
-failures_log="./sweep_failures.log"
+result_root="./${engine}/${gpu}/${model_name}/burstgpt/rate${request_rate}"
+mkdir -p "$result_root"
+failures_log="${result_root}/sweep_failures.log"
 : > "$failures_log"
 
 # ============================ server lifecycle ============================
@@ -357,6 +328,7 @@ start_server() {
     --max-model-len "$max_model_len" \
     --port "$port" \
     --enable-logging-iteration-details \
+    --attention-config '{"backend": "FLASH_ATTN", "flash_attn_version": 2}' \
     ${torch_args[@]+"${torch_args[@]}"} \
     > >(grep --line-buffered "Iteration(" > "$log_file") 2>&1 &
   CURRENT_SERVER_PID=$!
@@ -454,7 +426,8 @@ write_profmeta() {
   "config": {
     "model": "${model}", "engine": "${engine}", "gpu": "${gpu}",
     "burstiness": ${burstiness}, "seed": ${seed}, "num_prompts": ${num_prompts},
-    "request_rate": ${request_rate}, "input_len": ${input_len}, "output_len": ${output_len}
+    "request_rate": ${request_rate}, "dataset_name": "burstgpt",
+    "dataset_path": "~/BurstGPT_without_fails_2.csv"
   },
   "iter_log": "$(basename "$log_file")",
   "result_json": "$(basename "$base").json",
@@ -473,22 +446,16 @@ EOF
 }
 
 # ================================ sweep ==================================
-echo ">>> sweep: model=${model} root=${output_root} port=${port} profiler=${profiler}" >&2
+echo ">>> sweep: model=${model} root=${result_root} profiler=${profiler}" >&2
 
-for input_len in "${input_lens[@]}"; do
-for output_len in "${output_lens[@]}"; do
-for request_rate in "${request_rates[@]}"; do
-for num_prompts in "${num_prompts_values[@]}"; do
-for burstiness in "${burstiness_vals[@]}"; do
-for seed in "${seeds[@]}"; do
-  result_root="${output_root}/in${input_len}out${output_len}"
-  out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
+for burstiness in 1.0 0.5 0.1; do
+for seed in 1 2 3 4; do
+  out_dir="${result_root}/burst${burstiness}"
   mkdir -p "$out_dir"
   log_file="${out_dir}/num_prompts${num_prompts}log_${seed}.txt"
-  base="${out_dir}/prompts${num_prompts}seed${seed}"   # shared basename for json + profiler outputs
-  tag="in=${input_len} out=${output_len} rate=${request_rate} prompts=${num_prompts} burst=${burstiness} seed=${seed}"
-  burst_tag="${burstiness//./p}"
-  NSYS_SESSION="vllmprof_i${input_len}_o${output_len}_r${request_rate}_p${num_prompts}_b${burst_tag}_s${seed}"  # per-config nsys session name
+  base="${out_dir}/seed${seed}"                        # shared basename for json + profiler outputs
+  tag="burst=${burstiness} seed=${seed}"
+  NSYS_SESSION="vllmprof_${num_prompts}_${seed}"        # per-config nsys session name
 
   # Per-config torch trace dir. vLLM needs an absolute path and writes its own
   # rank*/async_llm trace files + profiler_out_<rank>.txt into it, so the
@@ -520,13 +487,10 @@ for seed in "${seeds[@]}"; do
   bench_start_epoch=$(date +%s.%N)
   if vllm bench serve \
       --model "$model" \
-      --backend openai-chat \
-      --base-url "$bench_base_url" \
-      --endpoint /v1/chat/completions \
-      --dataset-name random \
-      --random-input-len "$input_len" \
-      --random-output-len "$output_len" \
-      --ignore-eos \
+      --backend openai \
+      --endpoint /v1/completions \
+      --dataset-name burstgpt \
+      --dataset-path ~/BurstGPT_without_fails_2.csv \
       --num-prompts "$num_prompts" \
       --request-rate "$request_rate" \
       --seed "$seed" \
@@ -536,7 +500,7 @@ for seed in "${seeds[@]}"; do
       --metric-percentiles "50,90,95,99" \
       --percentile-metrics "ttft,tpot,itl,e2el" \
       --result-dir "$out_dir" \
-      --result-filename "prompts${num_prompts}seed${seed}.json" \
+      --result-filename "seed${seed}.json" \
       ${bench_profile_flag[@]+"${bench_profile_flag[@]}"}
   then
     echo ">>> [${tag}] benchmark done" >&2
@@ -551,10 +515,6 @@ for seed in "${seeds[@]}"; do
   write_profmeta "$base" "$bench_start_epoch" "$bench_end_epoch"
 
   stop_server
-done
-done
-done
-done
 done
 done
 

@@ -56,19 +56,19 @@
 set -euo pipefail
 
 # ============================ shared constants ============================
-model="Qwen/Qwen3.5-9B"
-model_name="qwen-3.5-9b"
-engine="vllm"
+model="meta-llama/Llama-3.1-8B"
+model_name="llama.3-1.8b"
+#model="zai-org/GLM-4.7-Flash"
+#model_name="glm-4.7-flash"
+engine="vllm-fa2"
 gpu="h200"
 
 # Workload sweep values. Single-value arrays preserve the old defaults while
 # keeping every workload parameter in the sweep loop where paths are built.
 request_rates=(40)
 num_prompts_values=(1000)
-input_lens=(128)
-output_lens=(128)
-burstiness_vals=(1.0 0.5 0.1)
-seeds=(0)
+input_lens=(256)
+output_lens=(256)
 
 # server launch flags (kept from your serve script; server must serve the
 # SAME model the benchmark hits, so both are driven from $model)
@@ -357,6 +357,7 @@ start_server() {
     --max-model-len "$max_model_len" \
     --port "$port" \
     --enable-logging-iteration-details \
+    --attention-config '{"backend": "FLASH_ATTN", "flash_attn_version": 2}' \
     ${torch_args[@]+"${torch_args[@]}"} \
     > >(grep --line-buffered "Iteration(" > "$log_file") 2>&1 &
   CURRENT_SERVER_PID=$!
@@ -479,8 +480,8 @@ for input_len in "${input_lens[@]}"; do
 for output_len in "${output_lens[@]}"; do
 for request_rate in "${request_rates[@]}"; do
 for num_prompts in "${num_prompts_values[@]}"; do
-for burstiness in "${burstiness_vals[@]}"; do
-for seed in "${seeds[@]}"; do
+for burstiness in 1.0 0.5 0.1; do
+for seed in 0 1 2 3 4; do
   result_root="${output_root}/in${input_len}out${output_len}"
   out_dir="${result_root}/rate${request_rate}/burst${burstiness}"
   mkdir -p "$out_dir"
@@ -520,9 +521,9 @@ for seed in "${seeds[@]}"; do
   bench_start_epoch=$(date +%s.%N)
   if vllm bench serve \
       --model "$model" \
-      --backend openai-chat \
+      --backend openai \
       --base-url "$bench_base_url" \
-      --endpoint /v1/chat/completions \
+      --endpoint /v1/completions \
       --dataset-name random \
       --random-input-len "$input_len" \
       --random-output-len "$output_len" \
